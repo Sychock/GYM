@@ -33,6 +33,7 @@ a:hover{color:var(--accent)}
 @keyframes fadeup{from{opacity:0;transform:translateY(8px)}to{opacity:1;transform:none}}
 @keyframes blink{0%,100%{opacity:1}50%{opacity:.25}}
 @keyframes frameflip{0%,46%{opacity:0}54%,100%{opacity:1}}
+@keyframes restpulse{from{transform:scale(1);filter:brightness(1)}to{transform:scale(1.02);filter:brightness(1.25)}}
 </style>
 <script src="https://cdn.jsdelivr.net/npm/@supabase/supabase-js@2"></script>
 </helmet>
@@ -406,6 +407,17 @@ a:hover{color:var(--accent)}
 </div>
 </sc-if>
 
+<sc-if value="{{ restDone }}" hint-placeholder-val="{{ false }}">
+<div onClick="{{ clearDone }}" style="position:fixed;left:0;right:0;bottom:82px;z-index:31;display:flex;justify-content:center">
+<div style="width:100%;max-width:430px;padding:0 14px">
+<div style="background:var(--danger);border-radius:4px;padding:16px 14px;display:flex;align-items:center;gap:12px;cursor:pointer;animation:restpulse .55s ease-in-out infinite alternate">
+<div style="flex:1;font-size:17px;font-weight:800;color:#fff;letter-spacing:-.02em">ΤΕΛΟΣ ΞΕΚΟΥΡΑΣΗΣ</div>
+<div style="font-size:10px;font-weight:700;color:rgba(255,255,255,.75);letter-spacing:.16em;font-family:'JetBrains Mono',ui-monospace,monospace">GO</div>
+</div>
+</div>
+</div>
+</sc-if>
+
 <sc-if value="{{ restActive }}" hint-placeholder-val="{{ false }}">
 <div style="position:fixed;left:0;right:0;bottom:82px;z-index:30;display:flex;justify-content:center;pointer-events:none">
 <div style="width:100%;max-width:430px;padding:0 14px">
@@ -600,12 +612,13 @@ class Component extends DCLogic {
     d = this.migrate(d);
     if (this.migrated) { this.migrated = false; this.save(d); } else this.setState({ data: d });
     this.timer = setInterval(() => {
-      if (this.state.rest > 0) {
-        const next = this.state.rest - 1;
-        this.setState({ rest: next });
-        if (next === 0) this.ping();
-      }
-    }, 1000);
+      if (!this.restEnd) return;
+      const next = Math.max(0, Math.round((this.restEnd - Date.now()) / 1000));
+      if (next !== this.state.rest) this.setState({ rest: next });
+      if (next === 0) { this.restEnd = 0; this.releaseWake(); this.ping(); }
+    }, 250);
+    this.onTap = () => this.unlockAudio();
+    document.addEventListener("pointerdown", this.onTap);
     this.initAuth();
     this.onVis = () => {
       if (document.visibilityState === "visible" && this.sb && this.state.sess) this.pull(this.state.sess.user.id);
@@ -670,7 +683,9 @@ class Component extends DCLogic {
       .catch(() => this.setState({ sync: "offline" }));
   }
   componentWillUnmount() {
-    clearInterval(this.timer); clearInterval(this.syncTimer);
+    clearInterval(this.timer); clearInterval(this.syncTimer); clearTimeout(this.doneTimer);
+    this.releaseWake();
+    document.removeEventListener("pointerdown", this.onTap);
     document.removeEventListener("visibilitychange", this.onVis);
     window.removeEventListener("focus", this.onVis);
     window.removeEventListener("online", this.onVis);
@@ -761,11 +776,34 @@ class Component extends DCLogic {
   }
   patch(fn) { const d = JSON.parse(JSON.stringify(this.state.data)); fn(d); this.save(d); }
 
+  setRest(sec) {
+    this.restEnd = sec > 0 ? Date.now() + sec * 1000 : 0;
+    if (sec > 0) { this.unlockAudio(); this.acquireWake(); } else this.releaseWake();
+    this.setState({ rest: sec, restDone: false });
+  }
+
+  acquireWake() {
+    try {
+      if (navigator.wakeLock && !this.wake) navigator.wakeLock.request("screen").then(w => { this.wake = w; }).catch(() => {});
+    } catch (e) {}
+  }
+
+  releaseWake() { try { if (this.wake) { this.wake.release(); this.wake = null; } } catch (e) {} }
+
+  unlockAudio() {
+    try {
+      const Ctx = window.AudioContext || window.webkitAudioContext;
+      if (!this.ac) this.ac = new Ctx();
+      if (this.ac.state === "suspended") this.ac.resume();
+    } catch (e) {}
+  }
+
   ping() {
     try {
       const Ctx = window.AudioContext || window.webkitAudioContext;
-      const ac = new Ctx();
-      [0, 0.18, 0.36].forEach(t => {
+      const ac = this.ac || (this.ac = new Ctx());
+      if (ac.state === "suspended") ac.resume();
+      [0, 0.18, 0.36, 0.54].forEach(t => {
         const o = ac.createOscillator(), g = ac.createGain();
         o.frequency.value = 880; o.connect(g); g.connect(ac.destination);
         g.gain.setValueAtTime(0.0001, ac.currentTime + t);
@@ -774,7 +812,10 @@ class Component extends DCLogic {
         o.start(ac.currentTime + t); o.stop(ac.currentTime + t + 0.16);
       });
     } catch (e) {}
-    if (navigator.vibrate) navigator.vibrate([120, 60, 120]);
+    try { if (navigator.vibrate) navigator.vibrate([200, 90, 200, 90, 400]); } catch (e) {}
+    this.setState({ restDone: true });
+    clearTimeout(this.doneTimer);
+    this.doneTimer = setTimeout(() => this.setState({ restDone: false }), 6000);
   }
 
   base(item, d) {
@@ -860,8 +901,8 @@ class Component extends DCLogic {
           const cur = Number((x.log[k] || {}).sets) || 0;
           const nx = cur >= it.sets ? 0 : cur + 1;
           x.log[k] = Object.assign({}, x.log[k], { sets: nx, date: new Date().toISOString().slice(0, 10) });
-          if (autoRest && nx > 0 && nx < it.sets) this.setState({ rest: x.restSec });
-          else this.setState({ rest: 0 });
+          if (autoRest && nx > 0 && nx < it.sets) this.setRest(x.restSec);
+          else this.setRest(0);
         }),
         setReps: e => { const v = e.target.value; this.patch(x => { const k = it.id + "|" + week; x.log[k] = Object.assign({}, x.log[k], { reps: v === "" ? undefined : Number(v), date: new Date().toISOString().slice(0, 10) }); }); },
         plus: () => this.patch(x => { const k = it.id + "|" + week; const c = Number((x.log[k] || {}).reps) || 0; x.log[k] = Object.assign({}, x.log[k], { reps: c + 1, date: new Date().toISOString().slice(0, 10) }); }),
@@ -1006,8 +1047,10 @@ class Component extends DCLogic {
       calcOut: calc1rm ? fmt(calc1rm) : "—",
       restActive: s.rest > 0 && s.tab === "workout",
       restText: Math.floor(s.rest / 60) + ":" + String(s.rest % 60).padStart(2, "0"),
-      addRest: () => this.setState({ rest: s.rest + 30 }),
-      stopRest: () => this.setState({ rest: 0 }),
+      addRest: () => this.setRest(s.rest + 30),
+      stopRest: () => this.setRest(0),
+      restDone: !!s.restDone && s.tab === "workout",
+      clearDone: () => this.setState({ restDone: false }),
       navItems: navItems,
       exportCsv: () => {
         const rows = [["Ημέρα", "Τύπος", "Άσκηση", "Γύρος", "Κιλά", "Σετ στόχος", "Σετ ok", "Min reps", "Max reps", "Reps τελ. σετ", "Στόχος", "Ημερομηνία"]];
